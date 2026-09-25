@@ -1,3 +1,5 @@
+import logging
+
 from langchain.tools import tool
 
 from deerflow.config import get_app_config
@@ -5,30 +7,68 @@ from deerflow.utils.readability import ReadabilityExtractor
 
 from .infoquest_client import InfoQuestClient
 
+logger = logging.getLogger(__name__)
+
 readability_extractor = ReadabilityExtractor()
+
+# Sentinel the client compares against ("not configured"): every consumer tests
+# ``value > 0`` (or the 1-365 window), so an unusable operator value has to land here.
+_UNSET = -1
+
+
+def _coerce_seconds(value: object, option: str, default: int = _UNSET) -> int:
+    """Coerce an operator-supplied seconds/recency value into the int the client compares against.
+
+    Mirrors ``browserless._coerce_timeout`` / ``crawl4ai._coerce_timeout`` /
+    ``jina_ai._coerce_timeout``. These extras come straight from ``config.yaml``, and
+    ``resolve_env_variables`` hands a ``$VAR`` substitution over as the raw environment
+    string, so passing the value through unvalidated makes ``self.fetch_time > 0`` raise
+    ``TypeError`` out of the tool instead of fetching anything. Booleans, fractional and
+    non-numeric values fall back to ``default`` with a warning rather than being silently
+    truncated.
+    """
+    coerced: int | None
+    if isinstance(value, bool):
+        coerced = None
+    elif isinstance(value, int):
+        coerced = value
+    elif isinstance(value, float) and value.is_integer():
+        coerced = int(value)
+    elif isinstance(value, str):
+        try:
+            coerced = int(value.strip())
+        except ValueError:
+            coerced = None
+    else:
+        coerced = None
+
+    if coerced is None:
+        logger.warning("InfoQuest: invalid %s %r in config; using %s", option, value, default)
+        return default
+    return coerced
 
 
 def _get_infoquest_client() -> InfoQuestClient:
     search_config = get_app_config().get_tool_config("web_search")
-    search_time_range = -1
+    search_time_range = _UNSET
     if search_config is not None and "search_time_range" in search_config.model_extra:
-        search_time_range = search_config.model_extra.get("search_time_range")
+        search_time_range = _coerce_seconds(search_config.model_extra.get("search_time_range"), "search_time_range")
 
     fetch_config = get_app_config().get_tool_config("web_fetch")
-    fetch_time = -1
+    fetch_time = _UNSET
     if fetch_config is not None and "fetch_time" in fetch_config.model_extra:
-        fetch_time = fetch_config.model_extra.get("fetch_time")
-    fetch_timeout = -1
+        fetch_time = _coerce_seconds(fetch_config.model_extra.get("fetch_time"), "fetch_time")
+    fetch_timeout = _UNSET
     if fetch_config is not None and "timeout" in fetch_config.model_extra:
-        fetch_timeout = fetch_config.model_extra.get("timeout")
-    navigation_timeout = -1
+        fetch_timeout = _coerce_seconds(fetch_config.model_extra.get("timeout"), "timeout")
+    navigation_timeout = _UNSET
     if fetch_config is not None and "navigation_timeout" in fetch_config.model_extra:
-        navigation_timeout = fetch_config.model_extra.get("navigation_timeout")
+        navigation_timeout = _coerce_seconds(fetch_config.model_extra.get("navigation_timeout"), "navigation_timeout")
 
     image_search_config = get_app_config().get_tool_config("image_search")
-    image_search_time_range = -1
+    image_search_time_range = _UNSET
     if image_search_config is not None and "image_search_time_range" in image_search_config.model_extra:
-        image_search_time_range = image_search_config.model_extra.get("image_search_time_range")
+        image_search_time_range = _coerce_seconds(image_search_config.model_extra.get("image_search_time_range"), "image_search_time_range")
     image_size = "i"
     if image_search_config is not None and "image_size" in image_search_config.model_extra:
         image_size = image_search_config.model_extra.get("image_size")

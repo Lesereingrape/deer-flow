@@ -3,6 +3,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from deerflow.community.infoquest import tools
 from deerflow.community.infoquest.infoquest_client import InfoQuestClient
 
@@ -346,3 +348,91 @@ class TestImageSearch:
         # image_search_tool only passes query to client.image_search
         # site parameter is empty string by default
         mock_client.image_search.assert_called_once_with("sunset")
+
+
+class TestInfoQuestTimeoutCoercion:
+    """`config.yaml` extras reach the client unvalidated, so they must be coerced.
+
+    `resolve_env_variables` returns a `$VAR` substitution verbatim and an empty YAML
+    scalar is `None`, so a configured `timeout` can arrive as a string; every consumer
+    compares it against 0. The sibling providers (`browserless`, `crawl4ai`, `jina_ai`)
+    already coerce with a warning instead of raising out of the tool.
+    """
+
+    @pytest.mark.parametrize("value", ["$INFOQUEST_TIMEOUT", None, "", "off", True, False, 3.5, [30], {"seconds": 30}])
+    def test_coerce_seconds_falls_back_on_unusable_values(self, value):
+        assert tools._coerce_seconds(value, "timeout") == -1
+
+    @pytest.mark.parametrize(("value", "expected"), [(30, 30), (0, 0), (-1, -1), (30.0, 30), ("30", 30), ("  30  ", 30), ("600", 600)])
+    def test_coerce_seconds_accepts_integers_and_numeric_strings(self, value, expected):
+        assert tools._coerce_seconds(value, "timeout") == expected
+
+    def test_coerce_seconds_logs_the_rejected_value(self, caplog):
+        with caplog.at_level("WARNING"):
+            assert tools._coerce_seconds("off", "fetch_time") == -1
+        assert "invalid fetch_time 'off'" in caplog.text
+
+    @patch("deerflow.community.infoquest.tools.get_app_config")
+    def test_client_receives_ints_when_config_is_not(self, mock_get_app_config):
+        mock_config = MagicMock()
+        mock_config.get_tool_config.side_effect = [
+            MagicMock(model_extra={"search_time_range": "7"}),  # web_search: numeric string is usable
+            # web_fetch: env-substituted string and blank YAML are not; bool is rejected, "60" accepted
+            MagicMock(model_extra={"fetch_time": "$INFOQUEST_FETCH_TIME", "timeout": True, "navigation_timeout": "60"}),
+            MagicMock(model_extra={"image_search_time_range": None, "image_size": "l"}),  # image_search: blank value
+        ]
+        mock_get_app_config.return_value = mock_config
+
+        client = tools._get_infoquest_client()
+
+        assert client.search_time_range == 7
+        assert client.fetch_time == -1
+        assert client.fetch_timeout == -1
+        assert client.fetch_navigation_timeout == 60
+        assert client.image_search_time_range == -1
+        assert client.image_size == "l"
+
+    @patch("deerflow.community.infoquest.infoquest_client.requests.post")
+    @patch("deerflow.community.infoquest.tools.get_app_config")
+    def test_fetch_still_runs_with_an_unparseable_timeout(self, mock_get_app_config, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = json.dumps({"reader_result": "<html><body>ok</body></html>"})
+        mock_post.return_value = mock_response
+        mock_config = MagicMock()
+        mock_config.get_tool_config.side_effect = [
+            MagicMock(model_extra={}),
+            MagicMock(model_extra={"fetch_time": "$FETCH_TIME", "timeout": "$TIMEOUT", "navigation_timeout": "off"}),
+            MagicMock(model_extra={}),
+        ]
+        mock_get_app_config.return_value = mock_config
+
+        client = tools._get_infoquest_client()
+        result = client.fetch("https://example.com")
+
+        assert result == "<html><body>ok</body></html>"
+        # Unusable values mean "not configured": the request keeps its default shape.
+        sent = mock_post.call_args.kwargs["json"]
+        assert "fetch_time" not in sent
+        assert "timeout" not in sent
+        assert "navi_timeout" not in sent
+
+    @patch("deerflow.community.infoquest.infoquest_client.requests.post")
+    @patch("deerflow.community.infoquest.tools.get_app_config")
+    def test_web_search_sends_a_numeric_string_time_range_as_int(self, mock_get_app_config, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"code": 0, "data": {"organic": []}}
+        mock_post.return_value = mock_response
+        mock_config = MagicMock()
+        mock_config.get_tool_config.side_effect = [
+            MagicMock(model_extra={"search_time_range": "7"}),
+            MagicMock(model_extra={}),
+            MagicMock(model_extra={}),
+        ]
+        mock_get_app_config.return_value = mock_config
+
+        client = tools._get_infoquest_client()
+        client.web_search_raw_results("test query", "")
+
+        assert mock_post.call_args.kwargs["json"]["time_range"] == 7
