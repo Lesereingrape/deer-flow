@@ -1,6 +1,7 @@
 """Unit tests for the Tavily community search and fetch tools."""
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -192,3 +193,91 @@ def test_web_fetch_preserves_unsuccessful_extract_results(response, expected) ->
         output = web_fetch_tool.invoke({"url": "https://example.com/report"})
 
     assert output == expected
+
+
+def _search_max_results_for_config(configured: object) -> object:
+    """Return the ``max_results`` the tool hands to the Tavily SDK for a deployed config value."""
+    configs = {
+        "web_search": ToolConfig(
+            name="web_search",
+            group="web",
+            use="deerflow.community.tavily.tools:web_search_tool",
+            api_key="search-key",
+            max_results=configured,
+        ),
+    }
+
+    with (
+        patch("deerflow.community.tavily.tools.get_app_config") as mock_config,
+        patch.object(TavilyClient, "search", autospec=True, return_value=_tavily_response()) as search,
+    ):
+        mock_config.return_value.get_tool_config.side_effect = configs.get
+        web_search_tool.invoke({"query": "documentation"})
+
+    return search.call_args.kwargs["max_results"]
+
+
+@pytest.mark.parametrize("configured", [3, 3.0, "3", " 3 "], ids=["int", "integral-float", "env-string", "padded-env-string"])
+def test_web_search_sends_an_integer_max_results(configured) -> None:
+    sent = _search_max_results_for_config(configured)
+
+    assert type(sent) is int
+    assert sent == 3
+
+
+@pytest.mark.parametrize("configured", [None, "", "   ", "off", True, False, 0, -3, 2.5, [], {}], ids=["blank", "empty", "spaces", "text", "true", "false", "zero", "negative", "fraction", "list", "mapping"])
+def test_web_search_falls_back_to_the_documented_default_for_unusable_max_results(configured) -> None:
+    assert _search_max_results_for_config(configured) == 5
+
+
+@pytest.mark.parametrize("configured", [None, "off", 0, 2.5], ids=["blank", "text", "zero", "fraction"])
+def test_web_search_logs_an_unusable_max_results(configured, caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="deerflow.community.tavily.tools"):
+        _search_max_results_for_config(configured)
+
+    assert [r.getMessage() for r in caplog.records] == [f"Invalid Tavily search max_results={configured!r}; using default 5"]
+
+
+def test_web_search_still_returns_results_with_an_unusable_max_results() -> None:
+    configs = {
+        "web_search": ToolConfig(
+            name="web_search",
+            group="web",
+            use="deerflow.community.tavily.tools:web_search_tool",
+            api_key="search-key",
+            max_results="",
+        ),
+    }
+
+    with (
+        patch("deerflow.community.tavily.tools.get_app_config") as mock_config,
+        patch.object(TavilyClient, "search", autospec=True, return_value=_tavily_response()) as search,
+    ):
+        mock_config.return_value.get_tool_config.side_effect = configs.get
+        result = web_search_tool.invoke({"query": "documentation"})
+
+    assert search.call_args.kwargs["max_results"] == 5
+    assert json.loads(result) == [{"title": "Release notes", "url": "https://example.com/releases", "snippet": "A recent release."}]
+
+
+def test_web_search_keeps_domain_filters_alongside_a_coerced_max_results() -> None:
+    configs = {
+        "web_search": ToolConfig(
+            name="web_search",
+            group="web",
+            use="deerflow.community.tavily.tools:web_search_tool",
+            api_key="search-key",
+            max_results="2",
+            include_domains=["docs.example.com"],
+        ),
+    }
+
+    with (
+        patch("deerflow.community.tavily.tools.get_app_config") as mock_config,
+        patch.object(TavilyClient, "search", autospec=True, return_value=_tavily_response()) as search,
+    ):
+        mock_config.return_value.get_tool_config.side_effect = configs.get
+        web_search_tool.invoke({"query": "documentation"})
+
+    client = search.call_args.args[0]
+    search.assert_called_once_with(client, "documentation", max_results=2, include_domains=["docs.example.com"], include_domains_mode="filter")
